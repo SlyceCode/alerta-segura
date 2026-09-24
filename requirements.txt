@@ -1,0 +1,10 @@
+# Dependencias de produccion (las que instala la imagen de Render).
+# Tras el primer despliegue verde conviene congelar versiones con pip freeze.
+Django==6.1
+gunicorn>=23.0
+whitenoise>=6.8
+psycopg[binary]>=3.2
+dj-database-url>=2.3
+celery>=5.4
+redis>=5.2
+requests==2.34.2

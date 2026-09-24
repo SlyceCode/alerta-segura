@@ -11,6 +11,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Cobertura
+.coverage
+coverage.xml
+htmlcov/
+
 # Django
 staticfiles/
 *.sqlite3

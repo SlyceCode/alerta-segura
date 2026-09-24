@@ -1,0 +1,228 @@
+# CI/CD de alerta-segura.
+#
+# Flujo:
+#   pull request  -> calidad + pruebas + seguridad + imagen
+#   push a main   -> lo anterior + despliegue en Render Dev + smoke test
+#   tag vX.Y.Z    -> lo anterior + despliegue en Render Prod (con aprobacion)
+#
+# Configuracion necesaria en el repositorio:
+#   secrets: RENDER_DEPLOY_HOOK_DEV, RENDER_DEPLOY_HOOK_PROD
+#   vars:    URL_DEV, URL_PROD   (p. ej. https://alerta-segura-dev.onrender.com)
+#   environments: dev, produccion (marcar "required reviewers" en produccion)
+
+name: pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      desplegar_produccion:
+        description: "Desplegar tambien a Render Prod"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  # Valores de relleno: ningun job de CI usa datos reales.
+  DJANGO_SECRET_KEY: clave-solo-para-ci-con-longitud-suficiente-1234567890
+  APP_ENV: ci
+
+jobs:
+  # ---------------------------------------------------------------------
+  calidad:
+    name: Calidad de codigo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        run: ruff check --output-format=github .
+
+      - name: Ruff (formato)
+        run: ruff format --check --diff .
+
+      - name: Comprobaciones de Django
+        run: python manage.py check
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.dev
+
+  # ---------------------------------------------------------------------
+  pruebas:
+    name: Pruebas
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: alerta
+          POSTGRES_PASSWORD: alerta
+          POSTGRES_DB: alerta
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U alerta"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings.test
+      DATABASE_URL: postgres://alerta:alerta@localhost:5432/alerta
+      REDIS_URL: redis://localhost:6379/0
+      APP_COMMIT: commit-de-prueba
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Migraciones sin aplicar
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: pytest con cobertura
+        run: pytest --cov --cov-report=term-missing --cov-report=xml --cov-fail-under=75
+
+      - name: Publicar cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobertura
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------
+  seguridad:
+    name: Seguridad
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Instalar dependencias
+        run: pip install -r requirements-dev.txt
+
+      - name: Bandit (codigo propio)
+        run: bandit -r config core analisis inteligencia motor catalogo curacion -ll
+
+      - name: pip-audit (dependencias)
+        run: pip-audit -r requirements.txt --strict
+
+      - name: check --deploy con la configuracion de produccion
+        run: python manage.py check --deploy --fail-level WARNING
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.prod
+          DATABASE_URL: sqlite:///ci.sqlite3
+          DJANGO_ALLOWED_HOSTS: alerta-segura.ejemplo
+          DJANGO_HSTS_PRELOAD: "true"
+
+  # ---------------------------------------------------------------------
+  imagen:
+    name: Imagen Docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Construir la imagen
+        run: docker build --build-arg APP_COMMIT=${{ github.sha }} -t alerta-segura:ci .
+
+      - name: Arrancar el contenedor con la configuracion de produccion
+        run: |
+          docker run -d --name alerta -p 8000:8000 \
+            -e DJANGO_SECRET_KEY="${DJANGO_SECRET_KEY}" \
+            -e DATABASE_URL="sqlite:////app/db.sqlite3" \
+            -e DJANGO_ALLOWED_HOSTS="localhost,127.0.0.1" \
+            -e DJANGO_SSL_REDIRECT="false" \
+            -e APP_ENV="ci" \
+            alerta-segura:ci
+
+      - name: Smoke test contra el contenedor
+        run: INTENTOS=20 ESPERA=3 bash scripts/smoke.sh http://localhost:8000 ${{ github.sha }}
+
+      - name: Logs del contenedor si algo fallo
+        if: failure()
+        run: docker logs alerta
+
+      - name: Limpiar
+        if: always()
+        run: docker rm -f alerta || true
+
+  # ---------------------------------------------------------------------
+  desplegar-dev:
+    name: Desplegar en Render Dev
+    needs: [calidad, pruebas, seguridad, imagen]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: ${{ vars.URL_DEV }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lanzar el despliegue
+        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_DEV }}" > /dev/null
+
+      - name: Smoke test del commit desplegado
+        run: INTENTOS=40 ESPERA=15 bash scripts/smoke.sh "${{ vars.URL_DEV }}" ${{ github.sha }}
+
+  # ---------------------------------------------------------------------
+  desplegar-produccion:
+    name: Desplegar en Render Prod
+    needs: [calidad, pruebas, seguridad, imagen]
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.desplegar_produccion)
+    runs-on: ubuntu-latest
+    environment:
+      name: produccion
+      url: ${{ vars.URL_PROD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lanzar el despliegue
+        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_PROD }}" > /dev/null
+
+      - name: Smoke test del commit desplegado
+        run: INTENTOS=40 ESPERA=15 bash scripts/smoke.sh "${{ vars.URL_PROD }}" ${{ github.sha }}
