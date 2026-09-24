@@ -1,2 +1,2 @@
 # alerta-segura
-Proyecto académico del curso de Arquitectura de Aplicaciones 2026.  
+- Proyecto académico del curso de Arquitectura de Aplicaciones 2026.  
